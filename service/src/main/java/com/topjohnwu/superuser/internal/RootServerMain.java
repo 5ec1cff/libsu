@@ -20,16 +20,20 @@ import android.annotation.SuppressLint;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.ContextWrapper;
+import android.content.res.AssetManager;
 import android.content.res.Resources;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.RemoteException;
 import android.os.UserHandle;
+import android.util.ArraySet;
 import android.util.Log;
 
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.concurrent.Callable;
 
 /*
@@ -71,6 +75,7 @@ class RootServerMain extends ContextWrapper implements Callable<Object[]> {
 
     @SuppressLint("PrivateApi")
     static Context getSystemContext() {
+        tryGetSystemResources();
         try {
             Class<?> atClazz = Class.forName("android.app.ActivityThread");
             Method systemMain = atClazz.getMethod("systemMain");
@@ -79,6 +84,83 @@ class RootServerMain extends ContextWrapper implements Callable<Object[]> {
             return (Context) getSystemContext.invoke(activityThread);
         } catch (Exception e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    @SuppressLint({"PrivateApi", "DiscouragedPrivateApi", "BlockedPrivateApi", "SoonBlockedPrivateApi", "NewApi"})
+    private static void tryGetSystemResources() {
+        try {
+            Method getSystemMethod = AssetManager.class.getDeclaredMethod("getSystem");
+            getSystemMethod.invoke(null);
+        } catch (Throwable e) {
+            // samsung mtk devices
+            Log.e("getSystemContext", "try get resources", e);
+            try {
+                // do the same thing as https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/core/java/android/content/res/AssetManager.java;l=253;drc=e0c7bc4b48055a091c02e1cd7a886d6857e95608
+                Field frameworkApkPathField = AssetManager.class.getDeclaredField("FRAMEWORK_APK_PATH");
+                frameworkApkPathField.setAccessible(true);
+                Field sSystemApkAssetsSetField = AssetManager.class.getDeclaredField("sSystemApkAssetsSet");
+                sSystemApkAssetsSetField.setAccessible(true);
+                Field sSystemApkAssetsField = AssetManager.class.getDeclaredField("sSystemApkAssets");
+                sSystemApkAssetsField.setAccessible(true);
+                Field sSystemField = AssetManager.class.getDeclaredField("sSystem");
+                sSystemField.setAccessible(true);
+
+                Class<?> apkAssetsClass = Class.forName("android.content.res.ApkAssets");
+
+                // public ApkAssets
+                Method loadFromPathMethod = apkAssetsClass.getDeclaredMethod("loadFromPath", String.class, int.class);
+                Method loadOverlayFromPathMethod = apkAssetsClass.getDeclaredMethod("loadOverlayFromPath", String.class, int.class);
+
+                Field propertySystemField = apkAssetsClass.getDeclaredField("PROPERTY_SYSTEM");
+                propertySystemField.setAccessible(true);
+                int propertySystem = propertySystemField.getInt(null);
+
+                Class<?> overlayConfigClass = Class.forName("com.android.internal.content.om.OverlayConfig");
+                // public OverlayConfig
+                Method getZygoteInstanceMethod = overlayConfigClass.getDeclaredMethod("getZygoteInstance");
+                // public String[]
+                Method createImmutableFrameworkIdmapsInZygoteMethod = overlayConfigClass.getDeclaredMethod("createImmutableFrameworkIdmapsInZygote");
+
+                ArrayList<Object /*ApkAssets*/> apkAssets = new ArrayList<>();
+
+                apkAssets.add(
+                        loadFromPathMethod.invoke(null,
+                                frameworkApkPathField.get(null),
+                                propertySystem
+                        )
+                );
+
+                String[] systemIdmapPaths = (String[]) createImmutableFrameworkIdmapsInZygoteMethod.invoke(
+                        getZygoteInstanceMethod.invoke(null)
+                );
+
+                for (String idmapPath: systemIdmapPaths) {
+                    apkAssets.add(
+                            loadOverlayFromPathMethod.invoke(null,
+                                    idmapPath,
+                                    propertySystem
+                            )
+                    );
+                }
+
+                sSystemApkAssetsSetField.set(null, new ArraySet<>(apkAssets));
+                Object arr = Array.newInstance(apkAssetsClass, apkAssets.size());
+                for (int i = 0; i < apkAssets.size(); i++) {
+                    Array.set(arr, i, apkAssets.get(i));
+                }
+                sSystemApkAssetsField.set(null, arr);
+                Constructor<AssetManager> constructor = AssetManager.class.getDeclaredConstructor(boolean.class);
+                constructor.setAccessible(true);
+                AssetManager manager = constructor.newInstance(true);
+                sSystemField.set(null, manager);
+
+                // public void
+                Method setApkAssets = AssetManager.class.getDeclaredMethod("setApkAssets", arr.getClass(), boolean.class);
+                setApkAssets.invoke(manager, arr, false);
+            } catch (Throwable t) {
+                Log.e("getSystemContext", "fixup failed", t);
+            }
         }
     }
 
